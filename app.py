@@ -2,11 +2,10 @@
 # Streamlit UI – KLN Freight Invoice Extractor (Air + Ocean)
 
 import io
-import os
 import re
 import traceback
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 
 import pdfplumber
 import pandas as pd
@@ -14,7 +13,7 @@ import streamlit as st
 from openpyxl import Workbook
 
 # --------------------------------------------------------------
-# Extract numeric invoice ID from filename
+# Extract invoice ID from filename
 # --------------------------------------------------------------
 def extract_invoice_id(filename: str):
     name = filename.upper()
@@ -47,6 +46,7 @@ HEADERS = [
     "Pieces", "Subtotal", "Freight_Mode", "Freight_Rate"
 ]
 
+
 # --------------------------------------------------------------
 # AIR PATTERNS
 # --------------------------------------------------------------
@@ -61,7 +61,6 @@ SHIPPER_PAT = re.compile(
 )
 
 PACKAGES_PAT = re.compile(r"(\d+)\s+PACKAGE\b", re.I)
-
 WEIGHT_PAT = re.compile(r"Gross Weight[:\s]+([\d.]+)\s*KG", re.I)
 VOL_PAT = re.compile(r"Volume Weight[:\s]+([\d.]+)\s*KG", re.I)
 
@@ -70,13 +69,15 @@ FREIGHT_AMOUNT_PAT = re.compile(
     re.I | re.M
 )
 
-SUBTOTAL_PAT = re.compile(
-    r"Total\s*[:\-]?\s*([\d,]+\.\d{2})\s*(USD|CAD|EUR)?",
+# Air subtotal pattern
+SUBTOTAL_PAT1 = re.compile(
+    r"Total\s*[:\-]?\s*([\d,]+\.\d{2})",
     re.I
 )
 
+
 # --------------------------------------------------------------
-# OCEAN / SEA PATTERNS
+# OCEAN PATTERNS
 # --------------------------------------------------------------
 OCEAN_FREIGHT_PAT = re.compile(
     r"OCEAN FREIGHT[^\n]*?([\d,]+\.\d{2})",
@@ -84,7 +85,13 @@ OCEAN_FREIGHT_PAT = re.compile(
 )
 
 OCEAN_TOTAL_PAT = re.compile(
-    r"PLEASE PAY THIS AMOUNT[-–>\s]*USD\s*([\d,]+\.\d{2})",
+    r"PLEASE PAY THIS AMOUNT[^\d]*([\d,]+\.\d{2})",
+    re.I
+)
+
+# "(4510.00)" pattern
+SUBTOTAL_PAT2 = re.compile(
+    r"\(([\d,]+\.\d{2})\)",
     re.I
 )
 
@@ -113,7 +120,6 @@ OCEAN_SHIPPER_PAT = re.compile(
 # PDF PARSER (AIR + OCEAN)
 # --------------------------------------------------------------
 def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, Any]]:
-
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             text = "\n".join(p.extract_text() or "" for p in pdf.pages)
@@ -124,12 +130,12 @@ def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, An
         if m:
             inv_date = m.group(1).strip()
 
-        # -------- Currency (FROM FILENAME ONLY) --------
+        # -------- Currency --------
         currency = extract_currency_from_filename(filename)
 
         # -------- Shipper --------
         shipper = None
-        m = SHIPPER_PAT.search(text)  # air shipper
+        m = SHIPPER_PAT.search(text)  # air
         if m:
             shipper = m.group(1).strip()
 
@@ -140,7 +146,7 @@ def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, An
 
         # -------- Pieces --------
         pieces = None
-        m = PACKAGES_PAT.search(text)  # air package
+        m = PACKAGES_PAT.search(text)  # air
         if m:
             pieces = int(m.group(1))
 
@@ -149,7 +155,7 @@ def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, An
             if m:
                 pieces = int(m.group(1))
 
-        # -------- Weight KG --------
+        # -------- Weight --------
         weight = None
         m = WEIGHT_PAT.search(text)  # air
         if m:
@@ -160,9 +166,9 @@ def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, An
             if m:
                 weight = float(m.group(1).replace(",", ""))
 
-        # -------- Volume (m³) --------
+        # -------- Volume m3 --------
         volume_m3 = None
-        m = VOL_PAT.search(text)  # air: volume weight KG → m3
+        m = VOL_PAT.search(text)  # air volume weight → m3
         if m:
             vol_kg = float(m.group(1))
             volume_m3 = vol_kg / 167.0
@@ -180,7 +186,7 @@ def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, An
         # -------- Chargeable CBM --------
         chargeable_cbm = volume_m3
 
-        # -------- Freight Mode & Rate --------
+        # -------- Freight Mode + Rate --------
         f_mode = None
         f_rate = None
 
@@ -190,24 +196,38 @@ def parse_invoice_pdf_bytes(data: bytes, filename: str) -> Optional[Dict[str, An
             f_mode = "Air"
             f_rate = float(m.group(1).replace(",", ""))
 
-        # Ocean freight (Option A = only the line item)
+        # Ocean freight (only main freight line)
         m = OCEAN_FREIGHT_PAT.search(text)
         if m:
             f_mode = "Ocean"
             f_rate = float(m.group(1).replace(",", ""))
 
-        # Ocean total (backup, if line not found)
+        # Backup ocean freight total
         if f_rate is None:
             m = OCEAN_TOTAL_PAT.search(text)
             if m:
                 f_mode = "Ocean"
                 f_rate = float(m.group(1).replace(",", ""))
 
-        # -------- Subtotal --------
+        # -------- Subtotal (AIR + OCEAN) --------
         subtotal = None
-        m = SUBTOTAL_PAT.search(text)
+
+        # Air-style "Total: 3,234.00"
+        m = SUBTOTAL_PAT1.search(text)
         if m:
             subtotal = float(m.group(1).replace(",", ""))
+
+        # Ocean-style "(4510.00)"
+        if subtotal is None:
+            m = SUBTOTAL_PAT2.search(text)
+            if m:
+                subtotal = float(m.group(1).replace(",", ""))
+
+        # Ocean-style "PLEASE PAY THIS AMOUNT --> 4510.00"
+        if subtotal is None:
+            m = OCEAN_TOTAL_PAT.search(text)
+            if m:
+                subtotal = float(m.group(1).replace(",", ""))
 
         # -------- Build Row --------
         return {
@@ -285,7 +305,7 @@ if extract_btn and uploads:
         st.subheader("Preview")
         st.dataframe(df, use_container_width=True)
 
-        # Build Excel output
+        # Build Excel
         output = io.BytesIO()
         wb = Workbook()
         ws = wb.active
